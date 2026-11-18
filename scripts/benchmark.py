@@ -1,492 +1,364 @@
-#!/usr/bin/env python
-"""Phase 0 benchmark: is "<= 10 s of processing per 1 hour of video" reachable on this machine?
+"""Phase 0 benchmark: can this machine process 1 hour of Teams recording in about 10 seconds?
 
-For one recording it measures:
-  1. resolution, frame rate, codec          (ffprobe)
-  2. keyframe interval                      (ffprobe -skip_frame nokey)
-  3. full GPU decode speed                  (ffmpeg -hwaccel cuda ... -f null)
-  4. keyframe-only GPU decode time          (ffmpeg -skip_frame nokey -hwaccel cuda ...)
-  5. audio extraction + Silero VAD time     (ffmpeg -> 16 kHz mono float32 -> batched VAD)
-and then projects the fast pipeline's cost per hour of video.
+Run it on the GPU machine with one real recording:
 
-Usage:
-    python scripts/benchmark.py meeting.mp4
-    python scripts/benchmark.py meeting.mp4 --max-seconds 600 --json bench.json
-    python scripts/benchmark.py meeting.mp4 --ffmpeg C:/ffmpeg/bin/ffmpeg.exe --ffprobe C:/ffmpeg/bin/ffprobe.exe
+    uv run python scripts/benchmark.py meeting.mp4
+    uv run python scripts/benchmark.py meeting.mp4 --max-seconds 600    # only the first 10 minutes
+    uv run python scripts/benchmark.py meeting.mp4 --device cpu         # no NVIDIA GPU (laptop)
+    uv run python scripts/benchmark.py meeting.mp4 --gpu-memory-gb 2    # GPU memory limit
+
+It measures five things and prints each result as it goes:
+    [1] Video info             resolution, frame rate, length
+    [2] Keyframes              how far apart they are
+    [3] Full decode            every frame: time (and VRAM on GPU)
+    [4] Keyframe-only decode   only the keyframes: time
+    [5] Audio + VAD            extract the audio, find where people speak
+Then [6] estimates the processing time per hour of video for three approaches.
+
+Needs: ffmpeg and ffprobe on PATH (with CUDA support), numpy, torch, silero-vad.
 """
-from __future__ import annotations
-
 import argparse
 import json
 import math
-import re
-import shutil
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
-from pathlib import Path
 
-try:
-    import numpy as np
-except ImportError:
-    sys.exit("ERROR: numpy is not installed - run: pip install -r requirements.txt")
+import numpy as np
 
-TARGET_S_PER_HOUR = 10.0
-PASS_D_OVERHEAD_S = 1.0          # rough cost of building segments + writing the CSV (Pass D)
-FULL_DECODE_SHARES = (0.05, 0.10, 0.20, 0.30)
-SAMPLE_RATE = 16000
-VAD_CHUNK = 512                  # Silero VAD v5 takes exactly 512 samples (32 ms) per step at 16 kHz
-VAD_THRESHOLD = 0.5
-VAD_MIN_GAP_S = 0.8              # pauses shorter than this are ignored (project brief)
-VAD_MIN_SPEECH_S = 0.25
+TARGET_SECONDS_PER_HOUR = 10.0
+
+SAMPLE_RATE = 16000           # Silero VAD works on 16 kHz mono audio
+VAD_CHUNK = 512               # Silero VAD reads 512 samples (= 32 ms) per step
+VAD_PIECE_SECONDS = 60        # audio is cut into 60 s pieces that run side by side
+VAD_THRESHOLD = 0.5           # speech probability above this counts as speech
+MIN_PAUSE_SECONDS = 0.8       # shorter pauses do not split speech
+MIN_SPEECH_SECONDS = 0.25     # shorter bits of "speech" are ignored
+SPEECH_MARGIN_SECONDS = 0.5   # extra video kept before and after each speech region
 
 
-# --------------------------------------------------------------------------- helpers
+# ------------------------------------------------------------------ helpers
 
-def log(msg: str = "") -> None:
-    print(msg, flush=True)
-
-
-def row(label: str, value: str) -> None:
-    log(f"  {label:<34} {value}")
+def run(cmd):
+    """Run a command and return its result, with stdout/stderr as text."""
+    return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
 
 
-def die(msg: str) -> None:
-    sys.exit(f"ERROR: {msg}")
-
-
-def last_lines(text: str, n: int = 4) -> str:
-    lines = [ln for ln in (text or "").strip().splitlines() if ln.strip()]
-    return "\n    ".join(lines[-n:])
-
-
-def parse_rate(text: str | None) -> float | None:
-    """'30000/1001' -> 29.97, '25' -> 25.0, '0/0' or junk -> None."""
-    if not text:
-        return None
+def gpu_memory_used_mb():
+    """GPU memory in use right now (all programs), in MB. None if nvidia-smi is missing."""
     try:
-        if "/" in text:
-            num, den = (float(x) for x in text.split("/", 1))
-            return num / den if num > 0 and den > 0 else None
-        val = float(text)
-        return val if val > 0 else None
-    except ValueError:
+        result = run(["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"])
+        return int(result.stdout.split()[0])
+    except (FileNotFoundError, IndexError, ValueError):
         return None
 
 
-def per_hour(seconds: float, media_s: float) -> float:
-    return seconds / media_s * 3600.0
+def per_hour(seconds, media_seconds):
+    """Scale a time measured on `media_seconds` of video up to 1 hour of video."""
+    return seconds / media_seconds * 3600
 
 
-def tool_path(name: str) -> str:
-    found = shutil.which(name)
-    if not found:
-        die(f"'{name}' not found. Install FFmpeg (see README) or pass --{Path(name).stem} <path>.")
-    return found
+def within_limit(used_mb, limit_gb):
+    """Text saying whether `used_mb` stays under the GPU memory limit."""
+    if used_mb is None:
+        return "unknown"
+    if used_mb <= limit_gb * 1024:
+        return f"within the {limit_gb} GB limit"
+    return f"OVER the {limit_gb} GB limit"
 
 
-# --------------------------------------------------------------------------- 1. video info
+# ------------------------------------------------------------------ [1] video info
 
-def probe(ffprobe: str, video: str) -> dict:
-    entries = ("format=duration,format_name:"
-               "stream=index,codec_type,codec_name,profile,width,height,pix_fmt,"
-               "r_frame_rate,avg_frame_rate,nb_frames,sample_rate,channels")
-    p = subprocess.run([ffprobe, "-v", "error", "-show_entries", entries, "-of", "json", video],
-                       capture_output=True, text=True, encoding="utf-8", errors="replace")
-    if p.returncode != 0:
-        die(f"ffprobe could not read the video:\n    {last_lines(p.stderr)}")
-    data = json.loads(p.stdout or "{}")
-    streams = data.get("streams", [])
-    v = next((s for s in streams if s.get("codec_type") == "video"), None)
-    a = next((s for s in streams if s.get("codec_type") == "audio"), None)
-    if v is None:
-        die("no video stream found")
-    duration = float(data.get("format", {}).get("duration") or 0)
-    if duration <= 0:
-        die("could not read the video duration")
+def video_info(video):
+    result = run(["ffprobe", "-v", "error", "-of", "json", "-show_entries",
+                  "format=duration:stream=codec_type,codec_name,width,height,avg_frame_rate", video])
+    if result.returncode != 0:
+        sys.exit(f"ffprobe could not read the video:\n{result.stderr}")
+
+    data = json.loads(result.stdout)
+    video_stream = next((s for s in data["streams"] if s["codec_type"] == "video"), None)
+    has_audio = any(s["codec_type"] == "audio" for s in data["streams"])
+    if video_stream is None or not has_audio:
+        sys.exit("The file needs both a video and an audio stream.")
+
+    num, den = video_stream["avg_frame_rate"].split("/")
     return {
-        "container": data.get("format", {}).get("format_name"),
-        "duration_s": duration,
-        "video_codec": v.get("codec_name"),
-        "video_profile": v.get("profile"),
-        "width": v.get("width"),
-        "height": v.get("height"),
-        "pix_fmt": v.get("pix_fmt"),
-        "r_frame_rate": parse_rate(v.get("r_frame_rate")),
-        "avg_frame_rate": parse_rate(v.get("avg_frame_rate")),
-        "audio_codec": a.get("codec_name") if a else None,
-        "audio_sample_rate": int(a["sample_rate"]) if a and a.get("sample_rate") else None,
-        "audio_channels": a.get("channels") if a else None,
+        "codec": video_stream["codec_name"],
+        "width": video_stream["width"],
+        "height": video_stream["height"],
+        "fps": float(num) / float(den) if float(den) else 0.0,
+        "duration": float(data["format"]["duration"]),
     }
 
 
-# --------------------------------------------------------------------------- 2. keyframes
+# ------------------------------------------------------------------ [2] keyframes
 
-def keyframe_interval(ffprobe: str, video: str, max_seconds: float | None) -> dict:
-    cmd = [ffprobe, "-v", "error", "-select_streams", "v:0", "-skip_frame", "nokey",
-           "-show_entries", "frame=pts_time,best_effort_timestamp_time", "-of", "csv=p=0"]
+def keyframe_times(video, max_seconds):
+    """Times (in seconds) of all keyframes, found with ffprobe -skip_frame nokey."""
+    cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", "-skip_frame", "nokey",
+           "-show_entries", "frame=pts_time", "-of", "csv=p=0"]
     if max_seconds:
         cmd += ["-read_intervals", f"%+{max_seconds}"]
-    cmd.append(video)
-    t0 = time.perf_counter()
-    p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
-    wall = time.perf_counter() - t0
-    if p.returncode != 0:
-        return {"ok": False, "error": last_lines(p.stderr), "ffprobe_wall_s": wall}
+    result = run(cmd + [video])
 
     times = []
-    for line in p.stdout.splitlines():
-        for field in line.split(","):          # first numeric field (pts_time, else best-effort)
-            try:
-                times.append(float(field))
-                break
-            except ValueError:
-                continue
-    times.sort()
-    gaps = [b - a for a, b in zip(times, times[1:]) if b > a]
-    out = {"ok": True, "count": len(times), "ffprobe_wall_s": wall}
-    if gaps:
-        out.update(mean_s=statistics.fmean(gaps), median_s=statistics.median(gaps),
-                   min_s=min(gaps), max_s=max(gaps))
-    return out
+    for line in result.stdout.split():
+        try:
+            times.append(float(line.strip(",")))
+        except ValueError:
+            pass  # a frame without a timestamp ("N/A")
+    return sorted(times)
 
 
-# --------------------------------------------------------------------------- 3 + 4. decoding
+# ------------------------------------------------------------------ [3] + [4] decoding
 
-def decode_cmd(ffmpeg: str, video: str, use_cuda: bool, max_seconds: float | None,
-               keyframes_only: bool) -> list[str]:
-    cmd = [ffmpeg, "-hide_banner", "-v", "error", "-nostats", "-progress", "pipe:1"]
-    if use_cuda:
-        # Frames stay in GPU memory: we measure pure NVDEC decode speed.
-        cmd += ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+def time_decode(video, max_seconds, keyframes_only, device):
+    """Decode the video on the CPU or GPU and throw the frames away.
+    Returns (seconds it took, extra VRAM used in MB - None on CPU)."""
+    cmd = ["ffmpeg", "-hide_banner", "-v", "error", "-nostats"]
+    if device == "gpu":
+        cmd += ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]   # decode on GPU, keep frames there
     if keyframes_only:
         cmd += ["-skip_frame", "nokey"]
     if max_seconds:
         cmd += ["-t", str(max_seconds)]
     cmd += ["-i", video, "-map", "0:v:0", "-fps_mode", "passthrough", "-f", "null", "-"]
-    return cmd
+
+    vram_before = gpu_memory_used_mb()
+    vram_peak = vram_before
+    with tempfile.TemporaryFile() as error_file:
+        start = time.perf_counter()
+        process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=error_file)
+        while True:  # check the VRAM every 0.5 s until FFmpeg is done
+            used = gpu_memory_used_mb()
+            if used is not None:
+                vram_peak = max(vram_peak, used)
+            try:
+                process.wait(timeout=0.5)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+        seconds = time.perf_counter() - start
+        error_file.seek(0)
+        errors = error_file.read().decode("utf-8", errors="replace")
+
+    if process.returncode != 0:
+        sys.exit(f"Decoding on {device.upper()} failed:\n{errors}")
+    extra_vram = vram_peak - vram_before if vram_before is not None else None
+    return seconds, extra_vram
 
 
-def run_decode(cmd: list[str]) -> dict:
-    t0 = time.perf_counter()
-    p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
-    wall = time.perf_counter() - t0
-    frames = re.findall(r"^frame=(\d+)", p.stdout, re.M)
-    speeds = re.findall(r"^speed=\s*([\d.]+)x", p.stdout, re.M)
-    return {
-        "ok": p.returncode == 0,
-        "wall_s": wall,
-        "frames": int(frames[-1]) if frames else None,
-        "ffmpeg_speed_x": float(speeds[-1]) if speeds else None,
-        "error": last_lines(p.stderr) if p.returncode != 0 else "",
-    }
+# ------------------------------------------------------------------ [5] audio + VAD
 
-
-def decode_with_fallback(ffmpeg: str, video: str, use_cuda: bool, max_seconds: float | None,
-                         keyframes_only: bool, allow_cpu_fallback: bool) -> dict:
-    res = run_decode(decode_cmd(ffmpeg, video, use_cuda, max_seconds, keyframes_only))
-    res["device"] = "cuda" if use_cuda else "cpu"
-    if not res["ok"] and use_cuda and allow_cpu_fallback:
-        log(f"  ! GPU decode failed, retrying on CPU:\n    {res['error']}")
-        cpu = run_decode(decode_cmd(ffmpeg, video, False, max_seconds, keyframes_only))
-        cpu["device"] = "cpu"
-        cpu["cuda_error"] = res["error"]
-        return cpu
-    return res
-
-
-def ffmpeg_has_cuda(ffmpeg: str) -> bool:
-    p = subprocess.run([ffmpeg, "-hide_banner", "-hwaccels"], capture_output=True, text=True,
-                       encoding="utf-8", errors="replace")
-    return "cuda" in p.stdout.split()
-
-
-def gpu_name() -> str | None:
-    if not shutil.which("nvidia-smi"):
-        return None
-    p = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
-                       capture_output=True, text=True, encoding="utf-8", errors="replace")
-    return p.stdout.strip().splitlines()[0] if p.returncode == 0 and p.stdout.strip() else None
-
-
-# --------------------------------------------------------------------------- 5. audio + VAD
-
-def extract_audio(ffmpeg: str, video: str, max_seconds: float | None) -> tuple[np.ndarray | None, float, str]:
-    cmd = [ffmpeg, "-hide_banner", "-v", "error", "-nostats"]
+def extract_audio(video, max_seconds):
+    """Extract the audio as 16 kHz mono float32. Returns (samples, seconds it took)."""
+    cmd = ["ffmpeg", "-hide_banner", "-v", "error", "-nostats"]
     if max_seconds:
         cmd += ["-t", str(max_seconds)]
     cmd += ["-i", video, "-map", "0:a:0", "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "f32le", "-"]
-    t0 = time.perf_counter()
-    p = subprocess.run(cmd, capture_output=True)
-    wall = time.perf_counter() - t0
-    if p.returncode != 0:
-        return None, wall, last_lines(p.stderr.decode("utf-8", errors="replace"))
-    return np.frombuffer(p.stdout, dtype=np.float32), wall, ""
+
+    start = time.perf_counter()
+    result = subprocess.run(cmd, capture_output=True)
+    seconds = time.perf_counter() - start
+    if result.returncode != 0:
+        sys.exit(f"Audio extraction failed:\n{result.stderr.decode('utf-8', errors='replace')}")
+    return np.frombuffer(result.stdout, dtype=np.float32), seconds
 
 
-def _sync(torch, device: str) -> None:
-    if device == "cuda":
-        torch.cuda.synchronize()
+def vad_probabilities(model, audio, device):
+    """Speech probability for every 32 ms of audio. Returns (probabilities, seconds it took).
 
+    Silero VAD reads the audio 32 ms at a time and remembers what it heard before, so
+    1 hour = 112,500 small steps one after another, which is slow. Instead we cut the audio
+    into 60 s pieces and feed all pieces at once as one batch: 1 hour = 60 pieces side by
+    side, only 1,875 steps. (Each piece starts with an empty memory; that only affects its
+    first fraction of a second.)
+    """
+    import torch
 
-def _vad_batched(torch, model, audio: np.ndarray, device: str, segment_s: float) -> tuple[np.ndarray, dict]:
-    """Silero VAD is a recurrent model that steps through audio 32 ms at a time.
-    Stepping through 1 h one chunk at a time = 112,500 sequential calls (slow).
-    Instead we cut the audio into `segment_s` pieces and run them side by side as one batch:
-    1 h with 60 s pieces = 60 rows x 1,875 steps. The model state restarts at each piece
-    boundary, which only affects the first fraction of a second of each piece."""
-    steps = max(1, int(segment_s * SAMPLE_RATE) // VAD_CHUNK)
+    steps = int(VAD_PIECE_SECONDS * SAMPLE_RATE) // VAD_CHUNK   # steps per piece (1,875)
     n_chunks = max(1, math.ceil(len(audio) / VAD_CHUNK))
-    rows = math.ceil(n_chunks / steps)
-    padded = np.zeros(rows * steps * VAD_CHUNK, dtype=np.float32)
-    padded[: len(audio)] = audio
-    # [rows, steps, chunk] -> [steps, rows, chunk]: x[i] is one contiguous batch for step i
-    x = torch.from_numpy(padded).view(rows, steps, VAD_CHUNK).transpose(0, 1).contiguous().to(device)
-    model = model.to(device)
+    n_pieces = math.ceil(n_chunks / steps)
+
+    padded = np.zeros(n_pieces * steps * VAD_CHUNK, dtype=np.float32)
+    padded[:len(audio)] = audio
+    # [pieces, steps, chunk] -> [steps, pieces, chunk], so batch[i] = step i of every piece
+    batch = torch.from_numpy(padded).view(n_pieces, steps, VAD_CHUNK).transpose(0, 1).contiguous()
+    batch = batch.to(device)
+    model.to(device)
 
     with torch.inference_mode():
-        t0 = time.perf_counter()
         model.reset_states()
-        for i in range(min(3, steps)):        # TorchScript optimises during the first calls
-            model(x[i], SAMPLE_RATE)
-        _sync(torch, device)
-        warmup = time.perf_counter() - t0
+        for i in range(min(3, steps)):   # warm-up: the first calls are slow
+            model(batch[i], SAMPLE_RATE)
+        model.reset_states()
 
-        model.reset_states()
-        probs = torch.empty(steps, rows, device=device)
-        t0 = time.perf_counter()
+        start = time.perf_counter()
+        probs = torch.empty(steps, n_pieces, device=device)
         for i in range(steps):
-            probs[i] = model(x[i], SAMPLE_RATE).view(-1)
-        flat = probs.transpose(0, 1).reshape(-1).cpu().numpy()   # back to time order (syncs GPU)
-        infer = time.perf_counter() - t0
+            probs[i] = model(batch[i], SAMPLE_RATE).view(-1)
+        probs = probs.transpose(0, 1).reshape(-1).cpu().numpy()   # back to time order
+        seconds = time.perf_counter() - start
 
-    return flat[:n_chunks], {"warmup_s": warmup, "infer_s": infer, "batch_rows": rows, "steps": steps}
+    return probs[:n_chunks], seconds
 
 
-def speech_regions(probs: np.ndarray) -> list[tuple[float, float]]:
+def speech_regions(probs):
+    """Turn per-32-ms probabilities into a list of (start, end) speech regions in seconds."""
     step = VAD_CHUNK / SAMPLE_RATE
-    on = np.concatenate([[0], (probs >= VAD_THRESHOLD).astype(np.int8), [0]])
-    d = np.diff(on)
-    starts, ends = np.flatnonzero(d == 1), np.flatnonzero(d == -1)
-    merged: list[list[float]] = []
-    for s, e in zip(starts * step, ends * step):
-        if merged and s - merged[-1][1] < VAD_MIN_GAP_S:
-            merged[-1][1] = e
+    regions = []
+    start = None
+    for i, p in enumerate(probs):
+        if p >= VAD_THRESHOLD and start is None:
+            start = i * step
+        elif p < VAD_THRESHOLD and start is not None:
+            regions.append([start, i * step])
+            start = None
+    if start is not None:
+        regions.append([start, len(probs) * step])
+
+    merged = []
+    for start, end in regions:          # join regions separated by a short pause
+        if merged and start - merged[-1][1] < MIN_PAUSE_SECONDS:
+            merged[-1][1] = end
         else:
-            merged.append([s, e])
-    return [(s, e) for s, e in merged if e - s >= VAD_MIN_SPEECH_S]
+            merged.append([start, end])
+    return [(s, e) for s, e in merged if e - s >= MIN_SPEECH_SECONDS]
 
 
-def run_vad(audio: np.ndarray, device_pref: str, segment_s: float) -> dict:
-    res: dict = {}
-    t0 = time.perf_counter()
-    try:
-        import torch
-    except ImportError:
-        return {"ok": False, "error": "torch not installed (see README)"}
-    res["torch_import_s"] = time.perf_counter() - t0
+def skippable_seconds(regions, media_seconds, keyframe_gap):
+    """How much video we never need to decode.
+    = every silence (after adding the margin around speech), minus one keyframe gap,
+    because decoding has to restart at the keyframe before the next speech."""
+    padded = []
+    for start, end in regions:
+        start = max(0.0, start - SPEECH_MARGIN_SECONDS)
+        end = min(media_seconds, end + SPEECH_MARGIN_SECONDS)
+        if padded and start <= padded[-1][1]:
+            padded[-1][1] = max(padded[-1][1], end)
+        else:
+            padded.append([start, end])
 
-    t0 = time.perf_counter()
-    try:
-        from silero_vad import load_silero_vad
-        model = load_silero_vad(onnx=False)
-    except Exception as e:  # noqa: BLE001
-        return {"ok": False, "error": f"silero-vad: {type(e).__name__}: {e}", **res}
-    res["model_load_s"] = time.perf_counter() - t0
+    # silences: from 0 to the first region, between regions, and from the last region to the end
+    edges = [0.0] + [t for region in padded for t in region] + [media_seconds]
+    silences = [edges[i + 1] - edges[i] for i in range(0, len(edges), 2)]
+    return sum(max(0.0, silence - keyframe_gap) for silence in silences)
 
-    device = device_pref
-    if device == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    try:
-        probs, timings = _vad_batched(torch, model, audio, device, segment_s)
-    except Exception as e:  # noqa: BLE001
-        if device == "cpu":
-            return {"ok": False, "error": f"VAD failed: {type(e).__name__}: {e}", **res}
-        res["cuda_error"] = f"{type(e).__name__}: {e}"
-        log(f"  ! VAD on CUDA failed ({res['cuda_error']}), retrying on CPU")
-        device = "cpu"
-        probs, timings = _vad_batched(torch, load_silero_vad(onnx=False), audio, device, segment_s)
 
-    t0 = time.perf_counter()
+# ------------------------------------------------------------------ main
+
+def main():
+    parser = argparse.ArgumentParser(description="Phase 0 benchmark (details at the top of this file).")
+    parser.add_argument("video", help="path to the Teams recording (MP4)")
+    parser.add_argument("--max-seconds", type=float, help="only use the first N seconds of the video")
+    parser.add_argument("--device", choices=["cpu", "gpu"], default="gpu",
+                        help="decode and run VAD on the CPU or the GPU (default: gpu)")
+    parser.add_argument("--gpu-memory-gb", type=float, default=2.0,
+                        help="max GPU memory to use, only with --device gpu (default: 2)")
+    args = parser.parse_args()
+    video, max_seconds, device = args.video, args.max_seconds, args.device
+
+    if device == "gpu" and gpu_memory_used_mb() is None:
+        sys.exit("GPU selected but no NVIDIA GPU was found (nvidia-smi is missing). Use --device cpu.")
+
+    # [1] Video info
+    info = video_info(video)
+    media = min(info["duration"], max_seconds) if max_seconds else info["duration"]
+    print(f"\n[1] Video: {video}")
+    print(f"    {info['width']}x{info['height']} {info['codec']}, {info['fps']:.2f} fps, "
+          f"{info['duration'] / 60:.1f} min")
+    if max_seconds:
+        print(f"    measuring the first {media:.0f} s only - all times below are scaled to 1 hour")
+    if device == "gpu":
+        print(f"    GPU memory already in use before we start: {gpu_memory_used_mb()} MB "
+              f"(our limit: {args.gpu_memory_gb} GB)")
+
+    # [2] Keyframes
+    print("\n[2] Keyframes")
+    times = keyframe_times(video, max_seconds)
+    gaps = [b - a for a, b in zip(times, times[1:])]
+    keyframe_gap = statistics.median(gaps) if gaps else media
+    print(f"    {len(times)} keyframes, typical gap {keyframe_gap:.2f} s "
+          f"(shortest {min(gaps, default=0):.2f} s, longest {max(gaps, default=0):.2f} s)")
+
+    # [3] Full decode
+    print(f"\n[3] Full decode on {device.upper()} (every frame)")
+    full_s, full_vram = time_decode(video, max_seconds, keyframes_only=False, device=device)
+    print(f"    {full_s:.1f} s = {media / full_s:.0f}x real time -> {per_hour(full_s, media):.1f} s per hour")
+    if device == "gpu":
+        print(f"    extra VRAM used: {full_vram} MB ({within_limit(full_vram, args.gpu_memory_gb)})")
+
+    # [4] Keyframe-only decode
+    print(f"\n[4] Keyframe-only decode on {device.upper()}")
+    key_s, _ = time_decode(video, max_seconds, keyframes_only=True, device=device)
+    print(f"    {key_s:.1f} s -> {per_hour(key_s, media):.1f} s per hour "
+          f"({key_s / max(1, len(times)) * 1000:.1f} ms per keyframe)")
+
+    # [5] Audio + VAD
+    print("\n[5] Audio + VAD")
+    audio, audio_s = extract_audio(video, max_seconds)
+    print(f"    audio extraction:  {audio_s:.1f} s -> {per_hour(audio_s, media):.1f} s per hour")
+
+    vram_before_torch = gpu_memory_used_mb()
+    start = time.perf_counter()
+    import torch
+    from silero_vad import load_silero_vad
+    model = load_silero_vad()
+    print(f"    startup (import torch + load VAD model, once per run): {time.perf_counter() - start:.1f} s")
+
+    probs, vad_s = vad_probabilities(model, audio, "cpu")
+    print(f"    VAD on CPU:        {vad_s:.1f} s -> {per_hour(vad_s, media):.1f} s per hour")
+    if device == "gpu" and torch.cuda.is_available():
+        # PyTorch's built-in cap: it stops with an out-of-memory error instead of going over the limit
+        total_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        torch.cuda.set_per_process_memory_fraction(min(1.0, args.gpu_memory_gb / total_gb))
+        try:
+            _, vad_gpu_s = vad_probabilities(model, audio, "cuda")
+            vram = gpu_memory_used_mb() - vram_before_torch if vram_before_torch is not None else None
+            print(f"    VAD on GPU:        {vad_gpu_s:.1f} s -> {per_hour(vad_gpu_s, media):.1f} s per hour "
+                  f"(VRAM incl. CUDA startup: {vram} MB, {within_limit(vram, args.gpu_memory_gb)})")
+            vad_s = min(vad_s, vad_gpu_s)
+        except Exception as error:
+            print(f"    VAD on GPU failed, using the CPU result ({type(error).__name__}: {error})")
+
     regions = speech_regions(probs)
-    timings["postprocess_s"] = time.perf_counter() - t0
-    res.update(timings)
-    res.update(ok=True, device=device, speech_regions=len(regions),
-               speech_total_s=sum(e - s for s, e in regions))
-    return res
+    speech_s = sum(end - start for start, end in regions)
+    skip_s = skippable_seconds(regions, media, keyframe_gap)
+    print(f"    speech: {speech_s / media:.0%} of the meeting ({len(regions)} speech regions)")
+    print(f"    video we can skip: {skip_s / media:.0%} "
+          f"(silences with a {SPEECH_MARGIN_SECONDS} s margin, minus one keyframe gap each)")
 
+    # [6] Estimates
+    audio_h = per_hour(audio_s + vad_s, media)
+    full_h = per_hour(full_s, media)
+    plan_a = full_h
+    plan_b = audio_h + full_h * (1 - skip_s / media)
+    plan_c = audio_h + per_hour(key_s, media)
 
-# --------------------------------------------------------------------------- 6. projection
+    print("\n[6] Estimated processing time for 1 hour of video (startup not included)")
+    for name, value in [("A. Decode every frame", plan_a),
+                        ("B. Audio first, skip silence", plan_b),
+                        ("C. Audio + keyframes only (best case)", plan_c)]:
+        status = "OK" if value <= TARGET_SECONDS_PER_HOUR else "too slow"
+        print(f"    {name:<40} {value:6.1f} s   {status}")
 
-def project(media_s: float, full: dict, key: dict, audio_wall: float | None, vad: dict | None) -> dict:
-    audio_h = 0.0
-    if audio_wall is not None and vad and vad.get("ok"):
-        audio_h = per_hour(audio_wall + vad["infer_s"] + vad["postprocess_s"], media_s)
-    key_h = per_hour(key["wall_s"], media_s) if key["ok"] else math.nan
-    full_h = per_hour(full["wall_s"], media_s) if full["ok"] else math.nan
-
-    budget = TARGET_S_PER_HOUR - audio_h - key_h - PASS_D_OVERHEAD_S
-    afford = max(0.0, budget / full_h) if full_h and not math.isnan(full_h) else math.nan
-    estimates = {p: audio_h + key_h + p * full_h + PASS_D_OVERHEAD_S for p in FULL_DECODE_SHARES}
-
-    if full.get("device") != "cuda" or key.get("device") != "cuda":
-        verdict = "NOT MEANINGFUL - decoding ran on the CPU, run this on the NVIDIA machine"
-    elif math.isnan(budget) or math.isnan(afford):
-        verdict = "UNKNOWN - a measurement failed"
-    elif budget <= 0:
-        verdict = "NO - audio + keyframe passes alone already exceed 10 s/h"
-    elif afford >= 0.20:
-        verdict = "YES - comfortable"
-    elif afford >= 0.05:
-        verdict = "MAYBE - depends on how much of the video is 'unclear' and needs full decoding"
+    print("\n    Verdict: ", end="")
+    if plan_a <= TARGET_SECONDS_PER_HOUR:
+        print("YES - even decoding every frame is fast enough.")
+    elif plan_b <= TARGET_SECONDS_PER_HOUR:
+        print("YES - with 'audio first, skip silence'.")
+    elif plan_c <= TARGET_SECONDS_PER_HOUR:
+        print(f"MAYBE - only with the keyframe approach. It leaves "
+              f"{TARGET_SECONDS_PER_HOUR - plan_c:.1f} s per hour for fully decoding unclear parts.")
     else:
-        verdict = "UNLIKELY - almost no budget left for full-decoding unclear stretches"
-    return {"audio_vad_s_per_h": audio_h, "keyframes_s_per_h": key_h, "full_decode_s_per_h": full_h,
-            "budget_for_full_decode_s_per_h": budget, "max_full_decode_share": afford,
-            "estimates_s_per_h": {f"{int(p*100)}%": v for p, v in estimates.items()},
-            "verdict": verdict}
+        print("NO - even the best case is over 10 s per hour on this machine.")
 
-
-# --------------------------------------------------------------------------- main
-
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("video", help="Teams recording (MP4)")
-    ap.add_argument("--max-seconds", type=float, default=None,
-                    help="only benchmark the first N seconds (default: whole video); results are scaled to 1 h")
-    ap.add_argument("--hwaccel", choices=["auto", "cuda", "none"], default="auto",
-                    help="video decoding: auto = CUDA if available, else CPU (default: auto)")
-    ap.add_argument("--vad-device", choices=["auto", "cuda", "cpu"], default="auto",
-                    help="device for Silero VAD (default: auto)")
-    ap.add_argument("--vad-segment-s", type=float, default=60.0,
-                    help="audio piece length for batched VAD (default: 60)")
-    ap.add_argument("--ffmpeg", default="ffmpeg", help="path to ffmpeg (default: from PATH)")
-    ap.add_argument("--ffprobe", default="ffprobe", help="path to ffprobe (default: from PATH)")
-    ap.add_argument("--json", type=Path, default=None, help="also save all results to this JSON file")
-    args = ap.parse_args()
-
-    video = str(Path(args.video))
-    if not Path(video).is_file():
-        die(f"video not found: {video}")
-    ffmpeg = args.ffmpeg if Path(args.ffmpeg).is_file() else tool_path(args.ffmpeg)
-    ffprobe = args.ffprobe if Path(args.ffprobe).is_file() else tool_path(args.ffprobe)
-    t_start = time.perf_counter()
-    results: dict = {"video": video, "max_seconds": args.max_seconds}
-
-    # ---- 1. video info
-    info = probe(ffprobe, video)
-    results["info"] = info
-    media_s = min(info["duration_s"], args.max_seconds) if args.max_seconds else info["duration_s"]
-    results["media_s_measured"] = media_s
-
-    log(f"\nBenchmark: {video}")
-    log(f"  GPU: {gpu_name() or 'none found (nvidia-smi missing)'}")
-    log("\n[1] Video")
-    row("Container / codec", f"{info['container']} / {info['video_codec']} {info['video_profile'] or ''}")
-    row("Resolution", f"{info['width']} x {info['height']}  ({info['pix_fmt']})")
-    row("Duration", f"{info['duration_s']:.1f} s ({info['duration_s']/60:.1f} min)"
-        + (f" - measuring first {media_s:.0f} s" if args.max_seconds else ""))
-    r, avg = info["r_frame_rate"], info["avg_frame_rate"]
-    row("Frame rate (r / avg)", f"{r or 0:.3f} / {avg or 0:.3f} fps")
-    if r and avg and abs(r - avg) / r > 0.01:
-        row("", "-> r and avg differ: probably VARIABLE frame rate (use real PTS, never index/fps)")
-    row("Audio", f"{info['audio_codec']}, {info['audio_sample_rate']} Hz, {info['audio_channels']} ch"
-        if info["audio_codec"] else "none")
-
-    # ---- 2. keyframe interval
-    log("\n[2] Keyframe interval (ffprobe -skip_frame nokey)")
-    kf = keyframe_interval(ffprobe, video, args.max_seconds)
-    results["keyframe_interval"] = kf
-    if not kf["ok"]:
-        row("FAILED", kf["error"])
-    elif kf["count"] < 2:
-        row("Keyframes found", f"{kf['count']} - too few to compute an interval")
-    else:
-        fps = avg or r
-        row("Keyframes found", f"{kf['count']}  (~{kf['count'] / media_s * 3600:.0f} per hour)")
-        row("Interval median / mean", f"{kf['median_s']:.2f} s / {kf['mean_s']:.2f} s"
-            + (f"  (~{kf['median_s'] * fps:.0f} frames per GOP)" if fps else ""))
-        row("Interval min / max", f"{kf['min_s']:.2f} s / {kf['max_s']:.2f} s")
-    row("(ffprobe time, CPU, info only)", f"{kf['ffprobe_wall_s']:.2f} s")
-
-    # ---- 3 + 4. decode speeds
-    want_cuda = args.hwaccel == "cuda" or (args.hwaccel == "auto" and gpu_name() and ffmpeg_has_cuda(ffmpeg))
-    allow_fallback = args.hwaccel == "auto"
-    log(f"\n[3] Full decode, every frame ({'GPU / NVDEC' if want_cuda else 'CPU'})")
-    full = decode_with_fallback(ffmpeg, video, bool(want_cuda), args.max_seconds, False, allow_fallback)
-    results["full_decode"] = full
-    if full["ok"]:
-        row("Device", full["device"])
-        row("Frames decoded", f"{full['frames']}")
-        row("Wall time", f"{full['wall_s']:.2f} s  ->  {per_hour(full['wall_s'], media_s):.1f} s per hour")
-        row("Speed", f"{media_s / full['wall_s']:.1f}x realtime  (ffmpeg reports speed={full['ffmpeg_speed_x']}x)"
-            + (f", {full['frames'] / full['wall_s']:.0f} fps" if full["frames"] else ""))
-    else:
-        row("FAILED", full["error"])
-
-    log(f"\n[4] Keyframe-only decode ({'GPU / NVDEC' if want_cuda else 'CPU'})")
-    key = decode_with_fallback(ffmpeg, video, bool(want_cuda), args.max_seconds, True, allow_fallback)
-    results["keyframe_decode"] = key
-    if key["ok"]:
-        row("Device", key["device"])
-        row("Keyframes decoded", f"{key['frames']}")
-        row("Wall time", f"{key['wall_s']:.2f} s  ->  {per_hour(key['wall_s'], media_s):.1f} s per hour")
-        if key["frames"]:
-            row("Per keyframe", f"{key['wall_s'] / key['frames'] * 1000:.1f} ms")
-    else:
-        row("FAILED", key["error"])
-
-    # ---- 5. audio + VAD
-    log("\n[5] Audio extraction + Silero VAD")
-    audio_wall, vad = None, None
-    if not info["audio_codec"]:
-        row("Skipped", "video has no audio stream")
-    else:
-        audio, audio_wall, err = extract_audio(ffmpeg, video, args.max_seconds)
-        results["audio_extract_s"] = audio_wall
-        if audio is None:
-            row("Audio extraction FAILED", err)
-        else:
-            row("Extraction (16 kHz mono)", f"{audio_wall:.2f} s  ->  {per_hour(audio_wall, media_s):.1f} s per hour")
-            vad = run_vad(audio, args.vad_device, args.vad_segment_s)
-            results["vad"] = vad
-            if not vad.get("ok"):
-                row("VAD FAILED", vad.get("error", "?"))
-            else:
-                row("Device", f"{vad['device']}  (batch of {vad['batch_rows']} x {vad['steps']} steps)")
-                row("VAD inference", f"{vad['infer_s']:.2f} s  ->  {per_hour(vad['infer_s'], media_s):.1f} s per hour")
-                row("Speech found (rough)", f"{vad['speech_regions']} regions, {vad['speech_total_s']:.0f} s "
-                    f"({vad['speech_total_s'] / media_s * 100:.0f}% of audio)")
-                row("Startup: torch import", f"{vad['torch_import_s']:.2f} s  (one-time, not per hour)")
-                row("Startup: model load + warm-up", f"{vad['model_load_s'] + vad['warmup_s']:.2f} s  (one-time)")
-
-    # ---- 6. projection
-    proj = project(media_s, full, key, audio_wall, vad)
-    results["projection"] = proj
-    log("\n[6] Projection for 1 hour of video (fast pipeline, startup excluded)")
-    row("Pass A  audio + VAD", f"{proj['audio_vad_s_per_h']:.1f} s")
-    row("Pass B  keyframes (decode only)", f"{proj['keyframes_s_per_h']:.1f} s")
-    row("Pass D  segments + CSV (guess)", f"{PASS_D_OVERHEAD_S:.1f} s")
-    row("Full decode of 100% (baseline)", f"{proj['full_decode_s_per_h']:.1f} s")
-    row("Left for Pass C (target 10 s)", f"{proj['budget_for_full_decode_s_per_h']:.1f} s")
-    if not math.isnan(proj["max_full_decode_share"]):
-        row("-> max share you can fully decode", f"{proj['max_full_decode_share'] * 100:.1f}% of the video")
-    for share, est in proj["estimates_s_per_h"].items():
-        mark = "ok" if est <= TARGET_S_PER_HOUR else "too slow"
-        row(f"If {share} of video is 'unclear'", f"{est:.1f} s per hour  ({mark})")
-    log(f"\n  VERDICT: 10 s/h reachable?  {proj['verdict']}")
-    log("  Notes: keyframe time does not yet include copying frames to RAM or the ring check;"
-        "\n         startup (torch import, model load) is reported above but excluded from the per-hour numbers.")
-
-    total = time.perf_counter() - t_start
-    results["benchmark_total_s"] = total
-    log(f"\n(benchmark itself took {total:.1f} s)")
-    if args.json:
-        args.json.write_text(json.dumps(results, indent=2, default=str), encoding="utf-8")
-        log(f"Results saved to {args.json}")
-    return 0
+    if device == "cpu":
+        print("\n    Note: CPU run - the times are NOT the GPU machine's. "
+              "Keyframe gap, speech % and skippable % are still correct.")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

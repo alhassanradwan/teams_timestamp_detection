@@ -1,10 +1,26 @@
 [project]
 name = "teams-timestamp-detection"
 version = "0.1.0"
-description = "Add your description here"
+description = "Find who spoke when in a Microsoft Teams meeting recording"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "numpy>=1.26",
+    "torch>=2.7",
+    "torchaudio>=2.7",
+    "silero-vad>=5.1",
+]
+
+# Get torch/torchaudio from PyTorch's own server (CUDA 12.8 build).
+# From normal PyPI, Windows only gets the CPU-only build.
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu128" }]
+torchaudio = [{ index = "pytorch-cu128" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
 
 [project.scripts]
 teams-timestamp-detection = "teams_timestamp_detection:main"
